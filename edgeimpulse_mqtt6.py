@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # edgeimpulse_mqtt.py
-# Raspberry Pi 4: publica detección de fuego filtrada + heartbeat cada 1s
+#   Raspberry Pi 4: publica detección filtrada (cigar, fireball) + heartbeat cada 1s
 # Después de 5 detecciones consecutivas, ignora nuevas detecciones por 60 segundos
 
 import subprocess
@@ -12,14 +12,16 @@ import sys
 import os
 
 # ---------- CONFIGURACIÓN ----------
-BROKER_IP = "192.168.1.86"
+BROKER_IP = "192.168.86.246"
 BROKER_PORT = 1883
-MQTT_TOPIC = "alerta/fuego"
+MQTT_TOPIC = "alerta/fuego" # Puedes cambiar esto si quieres, ej: "alerta/deteccion"
 RPI_ID = "RPI_1"
 runner_path = '/usr/bin/edge-impulse-linux-runner'
 model_path = 'model.eim'
-DESIRED_LABEL = "fire"
+# --- MODIFICADO ---
+DESIRED_LABELS = {"cigar", "fireball"} # Usamos un set para búsqueda rápida
 THRESHOLD = 0.90
+# ------------------
 HEARTBEAT_INTERVAL = 1     # manda OK cada 1 segundo
 REQUIRED_CONSECUTIVE = 5
 IGNORE_DURATION = 60        # segundos que se ignoran nuevas detecciones
@@ -40,19 +42,27 @@ except Exception as e:
 
 client.loop_start()
 
-# Variables de estado
-consecutive_fire = 0
-fire_active = False
+# Variables de estado (renombradas de 'fire' a 'detection')
+consecutive_detections = 0
+detection_active = False
 ignore_further_detections = False  # ignora detecciones por un tiempo
+last_box_published = None 
 
 def reset_ignore_flag():
-    global ignore_further_detections, fire_active, consecutive_fire
-    ignore_further_detections = False
-    fire_active = False
-    consecutive_fire = 0
+    global ignore_further_detections, detection_active, consecutive_detections, last_box_published
     print("[emisor] 🔵 Ignorar detecciones finalizado. Listo para detectar de nuevo.")
+    ignore_further_detections = False
+    detection_active = False
+    consecutive_detections = 0
+    last_box_published = None # Limpiamos la última caja
 
-def publish_fire_with_coords(box):
+def publish_detection_with_coords(box):
+    global last_box_published
+    
+    if box == last_box_published:
+        print("[emisor] Ignorando publicación duplicada de la misma detección.")
+        return
+
     x = box.get('x', 0)
     y = box.get('y', 0)
     width = box.get('width', 0)
@@ -62,7 +72,7 @@ def publish_fire_with_coords(box):
 
     payload = {
         "rpi_id": RPI_ID,
-        "label": box.get('label', 'fire'),
+        "label": box.get('label', 'unknown'), # <-- Envía la etiqueta detectada
         "confidence": box.get('value', 0.0),
         "x": x,
         "y": y,
@@ -74,13 +84,19 @@ def publish_fire_with_coords(box):
 
     try:
         client.publish(MQTT_TOPIC, json.dumps(payload))
-        print(f"[emisor] 🚨 FIRE enviado: {payload}")
+        # --- MODIFICADO ---
+        print(f"[emisor] 🚨 ALERTA enviada: {payload}")
+        # ------------------
+        last_box_published = box # Guardamos la caja que acabamos de publicar
     except Exception as e:
         print("[emisor] Error publicando MQTT:", e)
 
 def publish_heartbeat():
     while True:
-        if not fire_active:
+        # Solo manda heartbeat si no hay una alarma activa
+        # --- MODIFICADO ---
+        if not detection_active and not ignore_further_detections:
+        # ------------------
             payload = {
                 "rpi_id": RPI_ID,
                 "label": "none",
@@ -88,7 +104,6 @@ def publish_heartbeat():
             }
             try:
                 client.publish(MQTT_TOPIC, json.dumps(payload))
-                print(f"[emisor] Mensaje HEARTBEAT enviado: {payload}")
             except Exception as e:
                 print("[emisor] Error publicando heartbeat:", e)
         time.sleep(HEARTBEAT_INTERVAL)
@@ -108,43 +123,72 @@ except Exception as e:
     sys.exit(1)
 
 def read_loop():
-    global consecutive_fire, fire_active, ignore_further_detections
+    # --- MODIFICADO ---
+    global consecutive_detections, detection_active, ignore_further_detections
+    # ------------------
     for line in proc.stdout:
         line = line.strip()
-        if not line or ignore_further_detections:
+        
+        if ignore_further_detections:
             continue
-        print("[runner]", line)
+            
+        if not line:
+            continue
+        
+        if 'boundingBoxes' in line or 'anomaly' in line:
+            print("[runner]", line)
 
         if 'boundingBoxes' in line:
             try:
                 json_start = line.find('[')
+                if json_start == -1:
+                    continue
+                    
                 boxes = json.loads(line[json_start:])
 
-                fire_in_this_frame = False
+                # --- MODIFICADO ---
+                detection_in_this_frame = False
+                best_detection_box = None
+                # ------------------
+                max_confidence = 0
+
                 for box in boxes:
                     label = box.get('label', '')
                     value = box.get('value', 0.0)
-                    if label == DESIRED_LABEL and value >= THRESHOLD:
-                        fire_in_this_frame = True
-                        last_box = box
-                        print(f"[emisor] Detectado {label} con confianza {value:.2f}")
+                    
+                    # --- MODIFICADO: Comprueba si la etiqueta está en nuestro set ---
+                    if label in DESIRED_LABELS and value >= THRESHOLD:
+                        detection_in_this_frame = True
+                        if value > max_confidence:
+                            max_confidence = value
+                            best_detection_box = box # Guardamos la caja con mayor confianza
+                    # -----------------------------------------------------------
+                
+                # --- MODIFICADO (Variables renombradas) ---
+                if detection_in_this_frame:
+                    consecutive_detections += 1
+                    print(f"[emisor] Detectado {best_detection_box.get('label')} con confianza {max_confidence:.2f}")
+                    print(f"[emisor] Detecciones consecutivas: {consecutive_detections}")
 
-                if fire_in_this_frame:
-                    consecutive_fire += 1
-                    print(f"[emisor] Fuegos consecutivos: {consecutive_fire}")
+                    if consecutive_detections >= REQUIRED_CONSECUTIVE and not detection_active:
+                        detection_active = True
+                        ignore_further_detections = True # Inicia el modo "ignorar"
+                        
+                        publish_detection_with_coords(best_detection_box)
+                        
+                        print(f"[emisor] 🚀 Detección confirmada ({best_detection_box.get('label')}). Ignorando por {IGNORE_DURATION} segundos.")
 
-                    if consecutive_fire >= REQUIRED_CONSECUTIVE and not fire_active:
-                        fire_active = True
-                        ignore_further_detections = True
-                        publish_fire_with_coords(last_box)
-                        print(f"[emisor] 🚀 Fuego confirmado. Ignorando detecciones por {IGNORE_DURATION} segundos.")
-
-                        # Lanzar temporizador para reiniciar después de IGNORE_DURATION segundos
                         t = threading.Timer(IGNORE_DURATION, reset_ignore_flag)
                         t.start()
+                
+                else:
+                    if consecutive_detections > 0:
+                        print(f"[emisor] Racha de detección rota. Reseteando contador de {consecutive_detections} a 0.")
+                    consecutive_detections = 0
+                # -----------------------------------------------------------------
 
             except Exception as e:
-                print("[emisor] Error analizando boundingBoxes:", e)
+                print(f"[emisor] Error analizando boundingBoxes: {e} | Línea: {line}")
 
 # Iniciar hilos
 reader = threading.Thread(target=read_loop, daemon=True)
@@ -163,9 +207,13 @@ try:
 except KeyboardInterrupt:
     print("[emisor] Interrumpido por usuario.")
 finally:
+    print("[emisor] Cerrando...")
     try:
         proc.kill()
     except:
         pass
     client.loop_stop()
     client.disconnect()
+    print("[emisor] Desconectado y finalizado.")
+
+
